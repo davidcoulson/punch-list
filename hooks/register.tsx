@@ -29,7 +29,7 @@ import {
 import type { Change, ListFilter, Patch } from './list'
 
 const items = atom({ plugin: 'punch-list', key: 'items' } as const, [])
-const mtime = atom({ plugin: 'punch-list', key: 'mtime' } as const, 0)
+const revision = atom({ plugin: 'punch-list', key: 'revision' } as const, '')
 const error = atom({ plugin: 'punch-list', key: 'error' } as const, null)
 const bandOn = atom({ plugin: 'punch-list', key: 'bandOn' } as const, true)
 const panel = atom({ plugin: 'punch-list', key: 'panel' } as const, { isDoneShown: false })
@@ -45,96 +45,108 @@ const LIST = 'mcp__punch-list__list'
 // The desktop app's session-management server, as session-crew reaches it.
 const MGMT_SERVER = 'ccd_session_mgmt'
 const STORE_BAND = 'punch-list.band'
-// A lock older than this was left by a session that died mid-write.
-const LOCK_STALE_MS = 15_000
-const LOCK_TRIES = 80
+// How many times a write re-reads and re-applies after another session wrote first.
+const WRITE_TRIES = 6
+// How long the commit waits for the kernel lock, in seconds.
+const LOCK_WAIT_S = '10'
 
 // ---------------------------------------------------------------------------
-// The shared file: read freely, written under a lock, replaced by a rename.
+// The shared file. Reads take it as it stands; a write is compare-and-swap:
+// read, apply the change, write the result beside the file, then a child
+// process renames it over the file only if the file still holds what was read.
+// That check-and-rename runs under a kernel lock (lockf on macOS, flock on
+// Linux), which the OS releases when the child exits, so no lock is ever left
+// behind or taken from a live writer. Another session's write in between makes
+// the swap fail, and the change is applied again to what it wrote.
 
 // Set by register from the `file` option; resolved once per load.
 let fileOption = ''
 let resolvedPath: string | null = null
+// The lock command's argv up to the lock file, found once per load; [] when neither exists.
+let lockCommand: string[] | null = null
 
 async function pathOf($: EngineInterface): Promise<string> {
   if (resolvedPath) return resolvedPath
   const home = (await $.env.get('HOME')) ?? ''
+  let path: string
   if (fileOption.trim()) {
     const f = fileOption.trim()
-    resolvedPath = f.startsWith('~/') ? `${home}${f.slice(1)}` : f
+    path = f.startsWith('~/') ? `${home}${f.slice(1)}` : f
   } else {
     const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`
-    resolvedPath = `${dir.replace(/\/+$/, '')}/punch-list.json`
+    path = `${dir.replace(/\/+$/, '')}/punch-list.json`
   }
-  if (!resolvedPath.startsWith('/')) throw new Error(`the list file must be an absolute path, not ${resolvedPath}`)
-  return resolvedPath
+  if (!path.startsWith('/')) throw new Error(`the list file must be an absolute path, not ${path}`)
+  resolvedPath = path
+  return path
 }
 
 const dirOf = (path: string): string => path.slice(0, path.lastIndexOf('/')) || '/'
+const baseOf = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
 
-async function loadBook($: EngineInterface, path: string): Promise<PunchBook> {
-  if (!(await $.fs.exists(path))) return emptyBook()
+async function lockOf($: EngineInterface): Promise<string[]> {
+  if (lockCommand) return lockCommand
+  if (await $.fs.exists('/usr/bin/lockf')) lockCommand = ['/usr/bin/lockf', '-k', '-t', LOCK_WAIT_S]
+  else if (await $.fs.exists('/usr/bin/flock')) lockCommand = ['/usr/bin/flock', '-w', LOCK_WAIT_S]
+  else if (await $.fs.exists('/bin/flock')) lockCommand = ['/bin/flock', '-w', LOCK_WAIT_S]
+  else lockCommand = []
+  return lockCommand
+}
+
+// $1 missing|present, $2 the copy of what was read, $3 the file, $4 the new text.
+// Exit 3: the file changed since it was read.
+const COMMIT = [
+  'mode=$1 base=$2 file=$3 tmp=$4',
+  'if [ "$mode" = missing ]; then [ -e "$file" ] && { rm -f "$tmp" "$base"; exit 3; }',
+  'else cmp -s "$base" "$file" || { rm -f "$tmp" "$base"; exit 3; }; fi',
+  'mv -f "$tmp" "$file" || { rm -f "$tmp" "$base"; exit 1; }',
+  'rm -f "$base"',
+].join('\n')
+
+type Snapshot = { book: PunchBook; text: string | null }
+
+async function readSnapshot($: EngineInterface, path: string): Promise<Snapshot> {
+  if (!(await $.fs.exists(path))) return { book: emptyBook(), text: null }
   const text = await $.fs.read(path)
   try {
-    return parseBook(text)
+    return { book: parseBook(text), text }
   } catch (err) {
     throw new Error(`${path} is damaged (${err instanceof Error ? err.message : String(err)}); fix or move it. Nothing was written.`)
   }
 }
 
-/**
- * Runs `fn` holding the list's lock: a directory beside the file, made with
- * mkdir, which only one process can create. Every session's writes go through
- * here, so none is lost to another's.
- */
-async function withLock<T>($: EngineInterface, path: string, fn: () => Promise<T>): Promise<T> {
-  const lock = `${path}.lock`
-  let madeDir = false
-  for (let tries = 0; ; tries++) {
-    const r = await $.process.run(['/bin/mkdir', lock])
-    if (r.exitCode === 0) break
-    if (!/exists/i.test(r.stderr)) {
-      // No folder yet (a first run with a custom path): make it once, then try again.
-      if (madeDir) throw new Error(`can't lock the list: ${r.stderr.trim().slice(0, 200)}`)
-      madeDir = true
-      const p = await $.process.run(['/bin/mkdir', '-p', dirOf(path)])
-      if (p.exitCode !== 0) throw new Error(`can't create ${dirOf(path)}: ${p.stderr.trim().slice(0, 200)}`)
-      continue
-    }
-    const st = await $.fs.stat(lock).catch(() => undefined)
-    if (st && (await $.clock.now()) - st.mtimeMs > LOCK_STALE_MS) {
-      await $.process.run(['/bin/rmdir', lock])
-      continue
-    }
-    if (tries >= LOCK_TRIES) throw new Error(`another session holds the list's lock (${lock}); try again`)
-    await $.clock.sleep(25 + Math.floor(Math.random() * 50))
-  }
-  try {
-    return await fn()
-  } finally {
-    await $.process.run(['/bin/rmdir', lock]).catch(() => undefined)
-  }
-}
-
-/** Reads the file, applies `fn` and writes the result back whole, under the lock. */
+/** Applies `fn` to the file's list and swaps the result in, again on a conflict. */
 async function mutate($: EngineInterface, fn: (book: PunchBook, at: number) => Change): Promise<Change> {
   const path = await pathOf($)
   try {
-    const change = await withLock($, path, async () => {
-      const book = await loadBook($, path)
+    for (let attempt = 0; attempt < WRITE_TRIES; attempt++) {
+      const snap = await readSnapshot($, path)
       const at = await $.clock.now()
-      const ch = fn(book, at)
-      if (ch.book !== book) {
-        // Written beside the file, then renamed over it: a reader sees the old list or the new one, never half.
-        const tmp = `${path}.${at}-${Math.floor(Math.random() * 1e9)}.tmp`
-        await $.fs.write(tmp, serializeBook(ch.book))
-        const mv = await $.process.run(['/bin/mv', '-f', tmp, path])
-        if (mv.exitCode !== 0) throw new Error(`can't replace ${path}: ${mv.stderr.trim().slice(0, 200)}`)
+      const ch = fn(snap.book, at)
+      if (ch.book === snap.book) {
+        await publish($, snap.book.items, '')
+        return ch
       }
-      return ch
-    })
-    await publish($, change.book.items, path)
-    return change
+      const tok = `${at}-${Math.floor(Math.random() * 1e9)}`
+      const tmp = `${dirOf(path)}/.${baseOf(path)}.${tok}.tmp`
+      const base = `${dirOf(path)}/.${baseOf(path)}.${tok}.base`
+      // $.fs.write makes the folder too, on a first run.
+      await $.fs.write(tmp, serializeBook(ch.book))
+      if (snap.text !== null) await $.fs.write(base, snap.text)
+      const lock = await lockOf($)
+      const r = await $.process.run([
+        ...(lock.length ? [...lock, `${path}.lock`] : []),
+        '/bin/sh', '-c', COMMIT, 'sh', snap.text === null ? 'missing' : 'present', base, path, tmp,
+      ])
+      if (r.exitCode === 0) {
+        // The file's revision is learned by the next read, never from a stat that another write may have moved.
+        await publish($, ch.book.items, '')
+        return ch
+      }
+      // Exit 3: another session wrote first; read its list and apply the change again.
+      if (r.exitCode !== 3) throw new Error(`can't write ${path}: ${(r.stderr.trim() || `exit ${r.exitCode}`).slice(0, 200)}`)
+    }
+    throw new Error('other sessions kept changing the list; nothing was written. Try again.')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     await update($, error, () => msg)
@@ -142,15 +154,16 @@ async function mutate($: EngineInterface, fn: (book: PunchBook, at: number) => C
   }
 }
 
-/** Takes a list just read or written into this session's state. */
-async function publish($: EngineInterface, list: PunchItem[], path: string): Promise<void> {
-  const st = await $.fs.stat(path).catch(() => undefined)
+/** Takes a list into this session's state; `seen` is the file revision it came from, '' when unknown. */
+async function publish($: EngineInterface, list: PunchItem[], seen: string): Promise<void> {
   await update($, items, () => list)
-  await update($, mtime, () => st?.mtimeMs ?? 0)
+  await update($, revision, () => seen)
   await update($, error, () => null)
   await update($, now, () => Date.now())
   showStatus($, list)
 }
+
+const revOf = (st: { mtimeMs: number; size: number }): string => `${st.mtimeMs}:${st.size}`
 
 // One read at a time: a tick and a prompt arriving together share it.
 let refreshing: Promise<void> | null = null
@@ -168,13 +181,17 @@ function refresh($: EngineInterface, force = false): Promise<void> {
 async function refreshNow($: EngineInterface, force: boolean): Promise<void> {
   try {
     const path = await pathOf($)
-    const st = await $.fs.stat(path).catch(() => undefined)
-    if (!st) {
-      if (force || (await read($, items)).length) await publish($, [], path)
+    const before = await $.fs.stat(path).catch(() => undefined)
+    if (!before) {
+      if (force || (await read($, items)).length || (await read($, error))) await publish($, [], 'missing')
       return
     }
-    if (!force && st.mtimeMs === (await read($, mtime))) return
-    await publish($, (await loadBook($, path)).items, path)
+    if (!force && revOf(before) === (await read($, revision))) return
+    const snap = await readSnapshot($, path)
+    const after = await $.fs.stat(path).catch(() => undefined)
+    // Changed while it was read: keep what was read, but read again next time.
+    const seen = after && revOf(after) === revOf(before) ? revOf(before) : ''
+    await publish($, snap.book.items, seen)
   } catch (err) {
     await update($, error, () => (err instanceof Error ? err.message : String(err)))
   }

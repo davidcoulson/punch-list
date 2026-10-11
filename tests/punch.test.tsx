@@ -87,6 +87,9 @@ describe('the list', () => {
       'https://admin:pa55word@10.2.6.2:81/',
       'token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk',
       'aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3f',
+      'AIzaSy-abcdefghijklmnopqrstuvwxy-1234567',
+      'key Ab3-dE5_gH7-jK9_mN1-pQ3_sT5-vW7_yZ9',
+      'https://example.com/hook/Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3f/x',
     ])
       expect(secretReason(v)).not.toBe(null)
     for (const v of [
@@ -95,6 +98,10 @@ describe('the list', () => {
       'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
       'Session #local_c9d45d4a-fbf7-44d3-ad44-0ce4b5db1605',
       'Set CLAUDE_CODE_PLUGIN_DIRS in env',
+      'Review commit 03941dd0c4a1b2e3f4a5b6c7d8e9f0a1b2c3d4e5 before merging',
+      'https://github.com/x/y/commit/03941DD0c4a1b2e3f4a5b6c7d8e9f0a1b2c3d4e5',
+      'https://github.com/davidcoulson/ha-unraid-management-agent/compare/main...fork-v18',
+      'Session /home/dev/worktrees/ha-unraid-management-agent-90e093140e71a795/adoring-tu-5e87fb',
     ])
       expect(secretReason(v)).toBe(null)
     const r = addItem(emptyBook(), { text: 'Rotate it', detail: 'old key 0123456789abcdef0123456789abcdef' }, T0)
@@ -105,7 +112,15 @@ describe('the list', () => {
   test('a damaged file is an error, a missing one is empty, and numbers survive a reload', () => {
     expect(() => parseBook('{"oops":')).toThrow()
     expect(() => parseBook('[1,2]')).toThrow()
-    expect(parseBook('').items).toEqual([])
+    // An existing file must be one this code would have written: nothing in it is dropped on a rewrite.
+    expect(() => parseBook('')).toThrow()
+    const ok = { id: 1, text: 'A', status: 'open', created: '2026-10-11T18:00:00Z' }
+    expect(() => parseBook(JSON.stringify({ version: 2, next: 2, items: [ok] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [ok, { id: 2, status: 'open', created: 'x' }] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [ok, { ...ok }] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [{ ...ok, status: 'later' }] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [{ ...ok, link: 5 }] }))).toThrow()
+    expect(parseBook(JSON.stringify({ version: 1, next: 1, items: [ok] })).next).toBe(2)
     const b = clearDone(markDone(book(['A'], ['B']), [2], T0).book).book
     const back = parseBook(serializeBook(b))
     expect(back.next).toBe(3)
@@ -150,7 +165,15 @@ describe('the list', () => {
 // ---------------------------------------------------------------------------
 // The mod in a session, over an in-memory file system and fake mkdir/mv/rmdir.
 
-type Disk = { files: Map<string, { text: string; mtimeMs: number }>; dirs: Map<string, number>; tick: number }
+type Disk = {
+  files: Map<string, { text: string; mtimeMs: number }>
+  dirs: Map<string, number>
+  tick: number
+  /** Lock files the commits ran under. */
+  locks: string[]
+  /** Runs just before a commit checks the file: another session's write. */
+  beforeCommit?: () => void
+}
 
 const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
   const clock = mock.clock(on, { now: T0 })
@@ -168,7 +191,7 @@ const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
   on('ui.panes', () => ({ value: [] }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('tool.register', (_$, e) => ({ value: { tool: `mcp__punch-list__${e.name}` } }))
-  on('fs.exists', (_$, e) => ({ value: disk.files.has(e.path) || disk.dirs.has(e.path) }))
+  on('fs.exists', (_$, e) => ({ value: e.path === '/usr/bin/lockf' || disk.files.has(e.path) || disk.dirs.has(e.path) }))
   on('fs.read', (_$, e) => {
     const f = disk.files.get(e.path)
     return f ? { value: f.text } : { deny: `ENOENT: ${e.path}` }
@@ -186,38 +209,35 @@ const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
   })
   const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
   on('process.run', (_$, e) => {
-    const [cmd, ...args] = e.argv
-    if (cmd === '/bin/mkdir') {
-      const p = args.filter(a => a !== '-p')
-      const path = p[0] ?? ''
-      if (args.includes('-p')) {
-        disk.dirs.set(path, T0)
-        return { value: ok }
-      }
-      if (disk.dirs.has(path)) return { value: { ...ok, exitCode: 1, stderr: `mkdir: ${path}: File exists` } }
-      if (!disk.dirs.has(path.slice(0, path.lastIndexOf('/')))) return { value: { ...ok, exitCode: 1, stderr: `mkdir: ${path}: No such file or directory` } }
-      disk.dirs.set(path, disk.tick)
-      return { value: ok }
+    let argv = [...e.argv]
+    if (argv[0] === '/usr/bin/lockf') {
+      disk.locks.push(argv[4] ?? '')
+      argv = argv.slice(5)
     }
-    if (cmd === '/bin/rmdir') {
-      disk.dirs.delete(args[0] ?? '')
-      return { value: ok }
+    if (argv[0] !== '/bin/sh') return { value: { ...ok, exitCode: 127, stderr: 'unknown' } }
+    // The commit script: rename only if the file still holds what was read.
+    disk.beforeCommit?.()
+    const [, , , , mode, base = '', file = '', tmp = ''] = argv
+    const drop = () => {
+      disk.files.delete(tmp)
+      disk.files.delete(base)
     }
-    if (cmd === '/bin/mv') {
-      const [, from = '', to = ''] = args
-      const f = disk.files.get(from)
-      if (!f) return { value: { ...ok, exitCode: 1, stderr: 'mv: no such file' } }
-      disk.files.delete(from)
-      disk.files.set(to, { ...f, mtimeMs: touch() })
-      return { value: ok }
+    const changed = mode === 'missing' ? disk.files.has(file) : disk.files.get(base)?.text !== disk.files.get(file)?.text
+    if (changed) {
+      drop()
+      return { value: { ...ok, exitCode: 3 } }
     }
-    return { value: { ...ok, exitCode: 127, stderr: 'unknown' } }
+    const t = disk.files.get(tmp)
+    if (!t) return { value: { ...ok, exitCode: 1, stderr: 'mv: no such file' } }
+    disk.files.set(file, { ...t, mtimeMs: touch() })
+    drop()
+    return { value: ok }
   })
   return clock
 }
 
 const FILE = '/home/t/.claude/punch-list.json'
-const newDisk = (): Disk => ({ files: new Map(), dirs: new Map([['/home/t/.claude', 0]]), tick: T0 })
+const newDisk = (): Disk => ({ files: new Map(), dirs: new Map([['/home/t/.claude', 0]]), tick: T0, locks: [] })
 const bandProps = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100, scroll: { bodyRows: 9, offset: 0, total: 0 } }
 const onDisk = (d: Disk): PunchBook => JSON.parse(d.files.get(FILE)?.text ?? '{}') as PunchBook
 
@@ -231,7 +251,8 @@ describe('the mod', () => {
     const item = onDisk(disk).items[0]
     expect(item?.tag).toBe('security')
     expect(item?.source).toEqual({ session: 'cli-session-1', cwd: '/home/t/dev' })
-    expect(disk.dirs.has(`${FILE}.lock`)).toBe(false)
+    // Committed under the kernel lock, with no temporary file left beside the list.
+    expect(disk.locks).toEqual([`${FILE}.lock`])
     expect([...disk.files.keys()]).toEqual([FILE])
 
     const secret = await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Rotate it', detail: 'apikey=abcdef123456' } as never)
@@ -245,22 +266,39 @@ describe('the mod', () => {
     expect(String(listed.result)).toContain('✓ #1 Rotate the Sonarr API key')
   })
 
-  test('a lock held by a live session is waited for; a stale one is broken', { options: { pollSeconds: 0 } }, async ($, on) => {
+  test('a write that lost a race to another session is applied again to what that session wrote', { options: { pollSeconds: 0 } }, async ($, on) => {
     const disk = newDisk()
-    const clock = host(on, disk)
+    host(on, disk)
     await $.session.start({ cwd: '/tmp', surface: 'terminal' } as never)
-    // A lock left 20 s ago by a session that died.
-    disk.dirs.set(`${FILE}.lock`, T0 - 20_000)
-    const r = await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Set up an NPM proxy host' } as never)
-    expect(String(r.result)).toBe('added #1')
-    // A fresh lock: the add waits, and goes through once the other session lets go.
-    disk.dirs.set(`${FILE}.lock`, T0)
-    const pending = $.tool.call({ tool: 'mcp__punch-list__add', text: 'HPT firmware' } as never)
-    await clock.advance(200)
-    expect(onDisk(disk).items.length).toBe(1)
-    disk.dirs.delete(`${FILE}.lock`)
-    await clock.advance(200)
-    expect(String((await pending).result)).toBe('added #2')
+    expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Set up an NPM proxy host' } as never)).result)).toBe('added #1')
+    // Between this session's read and its commit, another session adds an item.
+    let raced = false
+    disk.beforeCommit = () => {
+      if (raced) return
+      raced = true
+      const other = addItem(parseBook(disk.files.get(FILE)?.text ?? ''), { text: 'Approve the fork deploy', tag: 'approve' }, T0 + 1).book
+      disk.files.set(FILE, { text: serializeBook(other), mtimeMs: (disk.tick += 1000) })
+    }
+    const r = await $.tool.call({ tool: 'mcp__punch-list__add', text: 'HPT firmware' } as never)
+    expect(String(r.result)).toBe('added #3')
+    expect(onDisk(disk).items.map(i => [i.id, i.text])).toEqual([
+      [1, 'Set up an NPM proxy host'],
+      [2, 'Approve the fork deploy'],
+      [3, 'HPT firmware'],
+    ])
+    expect([...disk.files.keys()]).toEqual([FILE])
+  })
+
+  test('the first write creates the file; a second session creating it first is not overwritten', { options: { pollSeconds: 0 } }, async ($, on) => {
+    const disk = newDisk()
+    host(on, disk)
+    await $.session.start({ cwd: '/tmp', surface: 'terminal' } as never)
+    disk.beforeCommit = () => {
+      if (disk.files.has(FILE)) return
+      disk.files.set(FILE, { text: serializeBook(addItem(emptyBook(), { text: 'From the other session' }, T0).book), mtimeMs: (disk.tick += 1000) })
+    }
+    expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Mine' } as never)).result)).toBe('added #2')
+    expect(onDisk(disk).items.map(i => i.text)).toEqual(['From the other session', 'Mine'])
   })
 
   test('a damaged file is reported and never written over', { options: { pollSeconds: 0 } }, async ($, on) => {
@@ -271,7 +309,7 @@ describe('the mod', () => {
     const r = await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Anything' } as never)
     expect(String(r.result)).toContain('damaged')
     expect(disk.files.get(FILE)?.text).toBe('{"items": [')
-    expect(disk.dirs.has(`${FILE}.lock`)).toBe(false)
+    expect([...disk.files.keys()]).toEqual([FILE])
   })
 
   test('another session\'s change shows up on the next poll', { options: { pollSeconds: 5 } }, async ($, on) => {

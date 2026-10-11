@@ -20,27 +20,42 @@ const DAY = 86_400_000
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v : undefined)
 
+const OPTIONAL = ['detail', 'link', 'tag', 'due', 'snoozedUntil', 'doneAt', 'doneNote', 'updated'] as const
+
 /**
- * Reads the shared file's text. Throws on text that is not a list, so a
- * damaged file is reported and never written over.
+ * Reads the shared file's text, strictly: anything this code would not have
+ * written (an empty file, another version, an item it cannot read whole) throws,
+ * so a damaged list is reported and never rewritten with records dropped.
  */
 export function parseBook(text: string): PunchBook {
-  if (!text.trim()) return emptyBook()
+  if (!text.trim()) throw new Error('the file is empty')
   const raw: unknown = JSON.parse(text)
   if (!isObj(raw) || !Array.isArray(raw.items)) throw new Error('not a punch list (no "items" array)')
+  if (raw.version !== 1) throw new Error(`version ${JSON.stringify(raw.version)} is not one this mod reads`)
   const items: PunchItem[] = []
-  for (const r of raw.items) {
-    if (!isObj(r) || typeof r.id !== 'number' || !str(r.text)) continue
-    const status: PunchStatus = r.status === 'done' || r.status === 'snoozed' ? r.status : 'open'
-    const at = str(r.created) ?? new Date(0).toISOString()
+  const ids = new Set<number>()
+  raw.items.forEach((r: unknown, n: number) => {
+    const bad = (why: string): never => {
+      throw new Error(`item ${n + 1}: ${why}`)
+    }
+    if (!isObj(r)) return bad('not an object')
+    if (typeof r.id !== 'number' || !Number.isInteger(r.id) || r.id < 1) return bad('no positive whole-number id')
+    if (ids.has(r.id)) return bad(`id ${r.id} appears twice`)
+    ids.add(r.id)
+    if (!str(r.text)) return bad('no text')
+    if (r.status !== 'open' && r.status !== 'done' && r.status !== 'snoozed') return bad(`unknown status ${JSON.stringify(r.status)}`)
+    if (!str(r.created)) return bad('no created time')
+    for (const k of OPTIONAL) if (r[k] !== undefined && typeof r[k] !== 'string') bad(`${k} is not text`)
+    if (r.source !== undefined && !isObj(r.source)) return bad('source is not an object')
+    const at = String(r.created)
     items.push({
       id: r.id,
       text: String(r.text),
       ...(str(r.detail) ? { detail: String(r.detail) } : {}),
       ...(str(r.link) ? { link: String(r.link) } : {}),
-      ...(str(r.tag) ? { tag: normalizeTag(String(r.tag)) } : {}),
+      ...(str(r.tag) ? { tag: String(r.tag) } : {}),
       ...(str(r.due) ? { due: String(r.due) } : {}),
-      status,
+      status: r.status,
       ...(str(r.snoozedUntil) ? { snoozedUntil: String(r.snoozedUntil) } : {}),
       created: at,
       updated: str(r.updated) ?? at,
@@ -48,9 +63,10 @@ export function parseBook(text: string): PunchBook {
       ...(str(r.doneNote) ? { doneNote: String(r.doneNote) } : {}),
       ...(isObj(r.source) ? { source: cleanSource(r.source) } : {}),
     })
-  }
+  })
   const highest = items.reduce((m, i) => Math.max(m, i.id), 0)
-  const next = typeof raw.next === 'number' && raw.next > highest ? raw.next : highest + 1
+  // `next` only ever grows, so a number cleared away is never handed out again.
+  const next = typeof raw.next === 'number' && Number.isInteger(raw.next) && raw.next > highest ? raw.next : highest + 1
   return { version: 1, next, items }
 }
 
@@ -69,17 +85,24 @@ const SECRET_PATTERNS: [RegExp, string][] = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----/, 'a private key'],
   [/\bgh[pousr]_[A-Za-z0-9]{20,}/, 'a GitHub token'],
   [/\bgithub_pat_[A-Za-z0-9_]{20,}/, 'a GitHub token'],
+  [/\bglpat-[A-Za-z0-9_-]{20,}/, 'a GitLab token'],
   [/\bxox[abposr]-[A-Za-z0-9-]{10,}/, 'a Slack token'],
-  [/\bAKIA[0-9A-Z]{16}\b/, 'an AWS access key'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/, 'an AWS access key'],
+  [/\bAIza[0-9A-Za-z_-]{35}/, 'a Google API key'],
   [/\b(?:sk|rk|pk)[-_](?:live|test|proj|ant)?[-_]?[A-Za-z0-9_-]{20,}/, 'an API key'],
+  [/\bhf_[A-Za-z0-9]{30,}/, 'a Hugging Face token'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}/, 'a JWT'],
   [/\b(?:api[_-]?key|apikey|token|secret|passw(?:or)?d|pwd|bearer)\b\s*[:=]\s*["']?[^\s"']{6,}/i, 'a credential assignment'],
   [/\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/, 'a bearer token'],
   [/:\/\/[^/\s:@]+:[^/\s@]+@/, 'a password inside a URL'],
 ]
 
-// Hex that is a commit or digest by its context, not a key.
-const HASH_CONTEXT = /(?:\/(?:commit|commits|tree|blob|compare)\/|sha256:|sha1:|\bsha\s*)$/i
+// Hex that is a commit or a digest by its context, not a key: `commit 0394…`,
+// `…/commit/0394…`, `sha256:…`, `digest: …`.
+const HASH_CONTEXT = /(?:\/(?:commit|commits|tree|blob|compare|releases\/tag)\/|\.\.\.?|@?sha(?:1|256|512)?[:\s-]*|\bcommit\s+|\bdigest[:\s]*|\brev(?:ision)?[:\s]+)$/i
+
+const isHex = (s: string): boolean => /^[A-Fa-f0-9]+$/.test(s)
+const isHashAt = (text: string, index: number, run: string): boolean => isHex(run) && HASH_CONTEXT.test(text.slice(Math.max(0, index - 40), index))
 
 /**
  * Why `text` looks like it holds a secret value, or null. Items name the
@@ -87,15 +110,13 @@ const HASH_CONTEXT = /(?:\/(?:commit|commits|tree|blob|compare)\/|sha256:|sha1:|
  */
 export function secretReason(text: string): string | null {
   for (const [re, what] of SECRET_PATTERNS) if (re.test(text)) return what
-  for (const m of text.matchAll(/[A-Fa-f0-9]{32,}/g)) {
-    const before = text.slice(Math.max(0, (m.index ?? 0) - 12), m.index)
-    const edgeOk = !/[A-Za-z0-9]/.test(text[(m.index ?? 0) - 1] ?? '') && !/[A-Za-z0-9]/.test(text[(m.index ?? 0) + m[0].length] ?? '')
-    if (edgeOk && !HASH_CONTEXT.test(before)) return 'a long hex key'
-  }
-  for (const m of text.matchAll(/[A-Za-z0-9+_=]{32,}/g)) {
-    const s = m[0]
-    if (/[a-z]/.test(s) && /[A-Z]/.test(s) && /[0-9]/.test(s)) return 'a long random-looking token'
-  }
+  // Long hex: Radarr, Sonarr and many other apps' API keys.
+  for (const m of text.matchAll(/(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])/g))
+    if (!isHashAt(text, m.index ?? 0, m[0])) return 'a long hex key'
+  // Long runs mixing cases and digits (hyphens and underscores allowed), alone or as a URL path segment.
+  for (const m of text.matchAll(/[A-Za-z0-9/=_+-]{32,}/g))
+    for (const seg of m[0].split('/'))
+      if (seg.length >= 32 && /[a-z]/.test(seg) && /[A-Z]/.test(seg) && seg.replace(/[^0-9]/g, '').length >= 3 && !isHex(seg)) return 'a long random-looking token'
   return null
 }
 

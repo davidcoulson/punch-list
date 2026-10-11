@@ -49,8 +49,8 @@ declare module 'claude-code' {
     'punch-list': {
       /** Every item in the shared file, as last read or written. */
       items: PunchItem[]
-      /** The file's mtime when last read or written, to spot other sessions' changes. */
-      mtime: number
+      /** The file's `mtime:size` when last read whole, to spot other sessions' changes; '' to read it again. */
+      revision: string
       /** Why the file could not be read or written, or null. */
       error: string | null
       /** Whether the band above the prompt shows (option, overridden by /todo band, kept in $.store). */
