@@ -1,0 +1,37 @@
+{
+  "name": "punch-list",
+  "version": "0.1.0",
+  "description": "One to-do list of things waiting on you, shared by every Claude Code session: Claude adds an item whenever it tells you to do something, a band above the prompt shows what's open, and /todo lists, ticks off and snoozes them.",
+  "author": {
+    "name": "David Coulson",
+    "url": "https://github.com/davidcoulson"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "file": {
+      "type": "string",
+      "title": "List file",
+      "description": "The JSON file every session shares. Empty: punch-list.json in the Claude config folder ($CLAUDE_CONFIG_DIR, else ~/.claude).",
+      "default": ""
+    },
+    "band": {
+      "type": "boolean",
+      "title": "Band above the prompt",
+      "description": "Shows the open count and the top items above the prompt. /todo band on|off overrides it.",
+      "default": true
+    },
+    "statusLine": {
+      "type": "boolean",
+      "title": "Status line count",
+      "description": "Shows 'to-do N' in the status line too.",
+      "default": true
+    },
+    "pollSeconds": {
+      "type": "number",
+      "title": "Check for changes (seconds)",
+      "description": "How often to look for changes other sessions made to the list; 0 checks only on each prompt.",
+      "default": 5
+    }
+  },
+  "license": "MIT"
+}
