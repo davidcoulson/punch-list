@@ -125,7 +125,11 @@ describe('the list', () => {
     expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [ok, { ...ok }] }))).toThrow()
     expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [{ ...ok, status: 'later' }] }))).toThrow()
     expect(() => parseBook(JSON.stringify({ version: 1, next: 2, items: [{ ...ok, link: 5 }] }))).toThrow()
-    expect(parseBook(JSON.stringify({ version: 1, next: 1, items: [ok] })).next).toBe(2)
+    // A counter that can't be trusted could hand out a cleared number again.
+    expect(() => parseBook(JSON.stringify({ version: 1, next: 1, items: [ok] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, next: '100', items: [] }))).toThrow()
+    expect(() => parseBook(JSON.stringify({ version: 1, items: [] }))).toThrow()
+    expect(parseBook(JSON.stringify({ version: 1, next: 9, items: [ok] })).next).toBe(9)
     const b = clearDone(markDone(book(['A'], ['B']), [2], T0).book).book
     const back = parseBook(serializeBook(b))
     expect(back.next).toBe(3)

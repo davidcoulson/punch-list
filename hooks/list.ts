@@ -65,8 +65,9 @@ export function parseBook(text: string): PunchBook {
     })
   })
   const highest = items.reduce((m, i) => Math.max(m, i.id), 0)
-  // `next` only ever grows, so a number cleared away is never handed out again.
-  const next = typeof raw.next === 'number' && Number.isInteger(raw.next) && raw.next > highest ? raw.next : highest + 1
+  // `next` only ever grows, so a number cleared away is never handed out again: one that can't be trusted is damage, not a default.
+  const next = raw.next
+  if (typeof next !== 'number' || !Number.isSafeInteger(next) || next <= highest) throw new Error(`"next" ${JSON.stringify(next)} is not a whole number above every item's id`)
   return { version: 1, next, items }
 }
 
