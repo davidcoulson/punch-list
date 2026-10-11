@@ -47,8 +47,11 @@ const MGMT_SERVER = 'ccd_session_mgmt'
 const STORE_BAND = 'punch-list.band'
 // How many times a write re-reads and re-applies after another session wrote first.
 const WRITE_TRIES = 6
-// How long the commit waits for the kernel lock, in seconds.
+// How long the commit waits for the kernel lock, in seconds; the child is killed well after.
 const LOCK_WAIT_S = '10'
+const COMMIT_TIMEOUT_MS = 20_000
+// Temp files older than this were left by a session that died mid-write.
+const LEFTOVER_MS = 10 * 60_000
 
 // ---------------------------------------------------------------------------
 // The shared file. Reads take it as it stands; a write is compare-and-swap:
@@ -93,6 +96,21 @@ async function lockOf($: EngineInterface): Promise<string[]> {
   return lockCommand
 }
 
+/** Removes temp files a session that died mid-write left beside the list. */
+async function sweepLeftovers($: EngineInterface): Promise<void> {
+  try {
+    const path = await pathOf($)
+    const prefix = `.${baseOf(path)}.`
+    const at = await $.clock.now()
+    const stale = (await $.fs.list(dirOf(path)))
+      .filter(f => f.kind === 'file' && f.name.startsWith(prefix) && /\.(tmp|base)$/.test(f.name) && at - f.mtimeMs > LEFTOVER_MS)
+      .map(f => `${dirOf(path)}/${f.name}`)
+    if (stale.length) await $.process.run(['/bin/rm', '-f', ...stale])
+  } catch {
+    // Nothing to sweep, or the folder isn't there yet.
+  }
+}
+
 // $1 missing|present, $2 the copy of what was read, $3 the file, $4 the new text.
 // Exit 3: the file changed since it was read.
 const COMMIT = [
@@ -127,24 +145,33 @@ async function mutate($: EngineInterface, fn: (book: PunchBook, at: number) => C
         await publish($, snap.book.items, '')
         return ch
       }
+      // Without a kernel lock, two sessions could both pass the check and one's rename undo the other's.
+      const lock = await lockOf($)
+      if (!lock.length) throw new Error("no lockf or flock on this machine, so the list can't be written safely; nothing was written.")
       const tok = `${at}-${Math.floor(Math.random() * 1e9)}`
       const tmp = `${dirOf(path)}/.${baseOf(path)}.${tok}.tmp`
       const base = `${dirOf(path)}/.${baseOf(path)}.${tok}.base`
-      // $.fs.write makes the folder too, on a first run.
-      await $.fs.write(tmp, serializeBook(ch.book))
-      if (snap.text !== null) await $.fs.write(base, snap.text)
-      const lock = await lockOf($)
-      const r = await $.process.run([
-        ...(lock.length ? [...lock, `${path}.lock`] : []),
-        '/bin/sh', '-c', COMMIT, 'sh', snap.text === null ? 'missing' : 'present', base, path, tmp,
-      ])
-      if (r.exitCode === 0) {
+      let code: number
+      try {
+        // $.fs.write makes the folder too, on a first run.
+        await $.fs.write(tmp, serializeBook(ch.book))
+        if (snap.text !== null) await $.fs.write(base, snap.text)
+        const r = await $.process.run([...lock, `${path}.lock`, '/bin/sh', '-c', COMMIT, 'sh', snap.text === null ? 'missing' : 'present', base, path, tmp], {
+          timeoutMs: COMMIT_TIMEOUT_MS,
+        })
+        code = r.exitCode
+        if (code !== 0 && code !== 3) throw new Error(`can't write ${path}: ${(r.stderr.trim() || `exit ${code}`).slice(0, 200)}`)
+      } catch (err) {
+        // The commit never ran, timed out waiting for the lock, or failed: its child is gone, so its files can go.
+        await $.process.run(['/bin/rm', '-f', tmp, base]).catch(() => undefined)
+        throw err
+      }
+      if (code === 0) {
         // The file's revision is learned by the next read, never from a stat that another write may have moved.
         await publish($, ch.book.items, '')
         return ch
       }
       // Exit 3: another session wrote first; read its list and apply the change again.
-      if (r.exitCode !== 3) throw new Error(`can't write ${path}: ${(r.stderr.trim() || `exit ${r.exitCode}`).slice(0, 200)}`)
     }
     throw new Error('other sessions kept changing the list; nothing was written. Try again.')
   } catch (err) {
@@ -375,6 +402,7 @@ export const register: Register = (on, options) => {
     // Ages, due dates and snoozes move with the clock.
     $.clock.every(60_000, () => void update($, now, () => Date.now()))
     await refresh($, true)
+    $.clock.after(5_000, () => void sweepLeftovers($))
     // The app's session server may still be connecting early in a session.
     $.clock.after(2_000, () => {
       void (async () => {

@@ -173,6 +173,10 @@ type Disk = {
   locks: string[]
   /** Runs just before a commit checks the file: another session's write. */
   beforeCommit?: () => void
+  /** No lockf or flock on this machine. */
+  noLock?: boolean
+  /** The lock is held elsewhere until lockf gives up (exit 75). */
+  lockBusy?: boolean
 }
 
 const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
@@ -191,7 +195,12 @@ const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
   on('ui.panes', () => ({ value: [] }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('tool.register', (_$, e) => ({ value: { tool: `mcp__punch-list__${e.name}` } }))
-  on('fs.exists', (_$, e) => ({ value: e.path === '/usr/bin/lockf' || disk.files.has(e.path) || disk.dirs.has(e.path) }))
+  on('fs.exists', (_$, e) => ({ value: (e.path === '/usr/bin/lockf' && !disk.noLock) || disk.files.has(e.path) || disk.dirs.has(e.path) }))
+  on('fs.list', (_$, e) => ({
+    value: [...disk.files.entries()]
+      .filter(([p]) => p.slice(0, p.lastIndexOf('/')) === e.path)
+      .map(([p, f]) => ({ name: p.slice(p.lastIndexOf('/') + 1), kind: 'file' as const, size: f.text.length, mtimeMs: f.mtimeMs, isLink: false })),
+  }))
   on('fs.read', (_$, e) => {
     const f = disk.files.get(e.path)
     return f ? { value: f.text } : { deny: `ENOENT: ${e.path}` }
@@ -210,6 +219,11 @@ const host = (on: Parameters<typeof mock.clock>[0], disk: Disk) => {
   const ok = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
   on('process.run', (_$, e) => {
     let argv = [...e.argv]
+    if (argv[0] === '/bin/rm') {
+      for (const f of argv.slice(2)) disk.files.delete(f)
+      return { value: ok }
+    }
+    if (argv[0] === '/usr/bin/lockf' && disk.lockBusy) return { value: { ...ok, exitCode: 75, stderr: 'lockf: cannot acquire lock' } }
     if (argv[0] === '/usr/bin/lockf') {
       disk.locks.push(argv[4] ?? '')
       argv = argv.slice(5)
@@ -299,6 +313,38 @@ describe('the mod', () => {
     }
     expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Mine' } as never)).result)).toBe('added #2')
     expect(onDisk(disk).items.map(i => i.text)).toEqual(['From the other session', 'Mine'])
+  })
+
+  test('no write without a kernel lock, and nothing left behind when the lock is busy', { options: { pollSeconds: 0 } }, async ($, on) => {
+    const disk = newDisk()
+    host(on, disk)
+    await $.session.start({ cwd: '/tmp', surface: 'terminal' } as never)
+    expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'First' } as never)).result)).toBe('added #1')
+    disk.lockBusy = true
+    expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'Second' } as never)).result)).toContain("can't write")
+    expect([...disk.files.keys()]).toEqual([FILE])
+    expect(onDisk(disk).items.length).toBe(1)
+  })
+
+  test('a machine with no lock utility refuses to write', { options: { pollSeconds: 0 } }, async ($, on) => {
+    const disk = newDisk()
+    disk.noLock = true
+    host(on, disk)
+    await $.session.start({ cwd: '/tmp', surface: 'terminal' } as never)
+    expect(String((await $.tool.call({ tool: 'mcp__punch-list__add', text: 'First' } as never)).result)).toContain('no lockf or flock')
+    expect([...disk.files.keys()]).toEqual([])
+  })
+
+  test('temp files a dead session left are swept; fresh ones are not', { options: { pollSeconds: 0 } }, async ($, on) => {
+    const disk = newDisk()
+    const clock = host(on, disk)
+    disk.files.set('/home/t/.claude/.punch-list.json.1-1.tmp', { text: '{}', mtimeMs: T0 - 3_600_000 })
+    disk.files.set('/home/t/.claude/.punch-list.json.1-1.base', { text: '{}', mtimeMs: T0 - 3_600_000 })
+    disk.files.set('/home/t/.claude/.punch-list.json.2-2.tmp', { text: '{}', mtimeMs: T0 })
+    disk.files.set('/home/t/.claude/settings.json', { text: '{}', mtimeMs: T0 - 3_600_000 })
+    await $.session.start({ cwd: '/tmp', surface: 'terminal' } as never)
+    await clock.advance(5_000)
+    expect([...disk.files.keys()].sort()).toEqual(['/home/t/.claude/.punch-list.json.2-2.tmp', '/home/t/.claude/settings.json'])
   })
 
   test('a damaged file is reported and never written over', { options: { pollSeconds: 0 } }, async ($, on) => {
