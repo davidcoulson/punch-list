@@ -446,8 +446,8 @@ export function dueLabel(i: PunchItem, at: number): string | null {
 export function line(i: PunchItem, at: number): string {
   const st = statusAt(i, at)
   const mark = st === 'done' ? '✓' : st === 'snoozed' ? 'z' : isUrgent(i, at) ? '!' : '•'
+  // The tag is the group heading this line sits under.
   const meta = [
-    i.tag,
     dueLabel(i, at),
     st === 'snoozed' && i.snoozedUntil ? `snoozed until ${whenLabel(Date.parse(i.snoozedUntil), at)}` : null,
     i.source?.name ? `from ${i.source.name}` : null,
