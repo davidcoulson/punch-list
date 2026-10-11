@@ -72,11 +72,16 @@ export function parseBook(text: string): PunchBook {
 
 export const serializeBook = (book: PunchBook): string => JSON.stringify(book, null, 2) + '\n'
 
-const cleanSource = (s: Record<string, unknown>): PunchSource => ({
-  ...(str(s.session) ? { session: String(s.session) } : {}),
-  ...(str(s.name) ? { name: String(s.name) } : {}),
-  ...(str(s.cwd) ? { cwd: String(s.cwd) } : {}),
-})
+// Where an item came from, minus any field that looks like it holds a secret
+// (a session title can hold anything): those are left out, not refused.
+const cleanSource = (s: Record<string, unknown>): PunchSource => {
+  const keep = (v: unknown): v is string => !!str(v) && secretReason(String(v)) === null
+  return {
+    ...(keep(s.session) ? { session: s.session } : {}),
+    ...(keep(s.name) ? { name: s.name } : {}),
+    ...(keep(s.cwd) ? { cwd: s.cwd } : {}),
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Secrets never go on the list
@@ -161,7 +166,7 @@ export function checkInput(fields: Record<string, unknown>): string | null {
 export function addItem(book: PunchBook, input: AddInput, at: number, source?: PunchSource): Change {
   const text = clip(input.text.trim().replace(/\s+/g, ' '), MAX_TEXT)
   if (!text) return { book, message: 'refused: the item has no text', ids: [] }
-  const refused = checkInput({ text, detail: input.detail, link: input.link })
+  const refused = checkInput({ text, detail: input.detail, link: input.link, tag: input.tag, due: input.due })
   if (refused) return { book, message: refused, ids: [] }
   const key = sameText(text)
   const twin = book.items.find(i => i.status !== 'done' && sameText(i.text) === key)
@@ -183,6 +188,7 @@ export function addItem(book: PunchBook, input: AddInput, at: number, source?: P
     }
   }
   const tag = input.tag ? normalizeTag(input.tag) : ''
+  const src = cleanSource(source ?? {})
   const item: PunchItem = {
     id: book.next,
     text,
@@ -193,7 +199,7 @@ export function addItem(book: PunchBook, input: AddInput, at: number, source?: P
     status: 'open',
     created: iso,
     updated: iso,
-    ...(source && Object.keys(source).length ? { source } : {}),
+    ...(Object.keys(src).length ? { source: src } : {}),
   }
   return { book: { ...book, next: book.next + 1, items: [...book.items, item] }, message: `added #${item.id}`, ids: [item.id] }
 }
@@ -213,7 +219,7 @@ export type Patch = {
 export function updateItem(book: PunchBook, id: number, patch: Patch, at: number): Change {
   const item = book.items.find(i => i.id === id)
   if (!item) return { book, message: `no item #${id}`, ids: [] }
-  const refused = checkInput({ text: patch.text, detail: patch.detail, link: patch.link, doneNote: patch.doneNote })
+  const refused = checkInput({ text: patch.text, detail: patch.detail, link: patch.link, tag: patch.tag, due: patch.due, doneNote: patch.doneNote })
   if (refused) return { book, message: refused, ids: [] }
   const iso = new Date(at).toISOString()
   const next: PunchItem = { ...item, updated: iso }

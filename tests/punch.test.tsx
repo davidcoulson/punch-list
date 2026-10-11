@@ -104,6 +104,11 @@ describe('the list', () => {
       'Session /home/dev/worktrees/ha-unraid-management-agent-90e093140e71a795/adoring-tu-5e87fb',
     ])
       expect(secretReason(v)).toBe(null)
+    expect(addItem(emptyBook(), { text: 'Rotate the password', tag: 'password=hunter2' }, T0).message).toContain('refused: tag')
+    const tagged = book(['Rotate the password'])
+    expect(updateItem(tagged, 1, { tag: 'password=hunter2' }, T0).message).toContain('refused: tag')
+    const sourced = addItem(emptyBook(), { text: 'A' }, T0, { session: 'local_1', name: 'password=hunter2', cwd: '/x' }).book
+    expect(sourced.items[0]?.source).toEqual({ session: 'local_1', cwd: '/x' })
     const r = addItem(emptyBook(), { text: 'Rotate it', detail: 'old key 0123456789abcdef0123456789abcdef' }, T0)
     expect(r.message).toContain('refused: detail')
     expect(r.book.items.length).toBe(0)
