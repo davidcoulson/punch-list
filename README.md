@@ -5,7 +5,7 @@ A Claude Code mod that keeps **one to-do list of the things waiting on you**, co
 When you run many sessions side by side, "you need to do X" ends up buried in a dozen chat replies. Examples: tick a box only a human may tick, approve a deploy, rotate a leaked key, or do a job for the next downtime. punch-list gives Claude tools to put each of those on a shared list as it says it, and to tick it off when you confirm or it verifies the job is done. You see the count in every session.
 
 ```
-☐ 6 to do  ● 1 need you · Rotate the Radarr and Sonarr API keys… · Set up an NPM proxy host for Cl…   [to-do]
+☐ 6 to do  ● 1 need you · Approve the staging deploy for t… · Replace the hallway sensor batt…   [to-do]
 ```
 
 ## What it does
@@ -61,14 +61,14 @@ The mod loads from this folder through `CLAUDE_CODE_PLUGIN_DIRS`, the same way s
 
 ```json
 "env": {
-  "CLAUDE_CODE_PLUGIN_DIRS": "/Users/david/dev/session-crew:/Users/david/dev/punch-list"
+  "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/session-crew:/path/to/punch-list"
 }
 ```
 
 Then open a new session; sessions that are already open don't pick it up. To try it once from a terminal instead:
 
 ```bash
-claude --plugin-dir /Users/david/dev/punch-list
+claude --plugin-dir /path/to/punch-list
 ```
 
 Options (`pluginConfigs["punch-list"]` in settings, or the config menu):
@@ -136,4 +136,4 @@ The script type-checks against the engine's types (it finds the most recent `plu
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

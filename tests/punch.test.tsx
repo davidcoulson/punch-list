@@ -84,7 +84,7 @@ describe('the list', () => {
       'api_key=hunter2hunter2',
       'use ghp_abcdefghijklmnopqrstuvwxyz0123',
       'sk-ant-abcdefghijklmnopqrstuvwx',
-      'https://admin:pa55word@10.2.6.2:81/',
+      'https://admin:pa55word@192.0.2.2:81/',
       'token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk',
       'aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3f',
       'AIzaSy-abcdefghijklmnopqrstuvwxy-1234567',
@@ -93,7 +93,7 @@ describe('the list', () => {
     ])
       expect(secretReason(v)).not.toBe(null)
     for (const v of [
-      'Rotate the Radarr and Sonarr API keys exposed in the Prismarr setup transcript',
+      'Rotate the Radarr and Sonarr API keys after the media server move',
       'https://github.com/davidcoulson/ha-unraid-management-agent/commit/03941dd0c4a1b2e3f4a5b6c7d8e9f0a1b2c3d4e5',
       'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
       'Session #local_c9d45d4a-fbf7-44d3-ad44-0ce4b5db1605',
